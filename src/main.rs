@@ -1,4 +1,6 @@
 mod anthropic;
+mod chat;
+mod claude_auth;
 mod config;
 mod convert;
 mod openai;
@@ -31,6 +33,7 @@ use crate::upstream::UpstreamError;
 struct AppState {
     cfg: Arc<Config>,
     client: reqwest::Client,
+    claude_code_version: String,
 }
 
 type Shared = Arc<AppState>;
@@ -53,13 +56,20 @@ async fn main() {
           haiku = ?cfg.haiku_model, default = ?cfg.default_model,
           search_provider = ?cfg.search_provider, "starting claude-openai-proxy");
 
-    let state: Shared = Arc::new(AppState { cfg: Arc::new(cfg), client });
+    let claude_code_version = match cfg.claude_code_version.clone() {
+        Some(v) => v,
+        None => detect_claude_code_version().await,
+    };
+    info!(claude_code_version = %claude_code_version, anthropic = %cfg.anthropic_base_url, "OpenAI-compatible side ready");
+    let state: Shared = Arc::new(AppState { cfg: Arc::new(cfg), client, claude_code_version });
     let app = Router::new()
         .route("/", get(health))
         .route("/health", get(health))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/models", get(models))
+        .route("/v1/chat/completions", post(chat_completions))
+        .route("/chat/completions", post(chat_completions))
         // Same API under an `/anthropic` prefix: some clients (Hermes Agent, gateways)
         // detect the Anthropic Messages transport from a base URL ending in `/anthropic`.
         .route("/anthropic/v1/messages", post(messages))
@@ -74,18 +84,116 @@ async fn main() {
     axum::serve(listener, app).await.expect("server error");
 }
 
+/// Version advertised in the OAuth user-agent; Anthropic rejects stale ones.
+async fn detect_claude_code_version() -> String {
+    const FALLBACK: &str = "2.1.267";
+    let fut = tokio::process::Command::new("claude").arg("--version").output();
+    match tokio::time::timeout(Duration::from_secs(5), fut).await {
+        Ok(Ok(out)) if out.status.success() => {
+            let s = String::from_utf8_lossy(&out.stdout);
+            s.split_whitespace()
+                .next()
+                .filter(|v| v.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
+                .map(str::to_string)
+                .unwrap_or_else(|| FALLBACK.into())
+        }
+        _ => FALLBACK.into(),
+    }
+}
+
+fn openai_error(e: &chat::OpenAiError) -> Response {
+    let code = StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    (code, Json(e.json())).into_response()
+}
+
+/// `POST /v1/chat/completions` -> Anthropic Messages API.
+async fn chat_completions(State(st): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+    let req: chat::ChatCompletionRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            let err = chat::OpenAiError { status: 400, kind: "invalid_request_error".into(), message: format!("invalid request body: {e}") };
+            return openai_error(&err);
+        }
+    };
+    let client_bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+        .map(str::to_string);
+    let input = chat::ChatInput {
+        client: st.client.clone(),
+        cfg: st.cfg.clone(),
+        req: req.clone(),
+        client_bearer,
+        claude_code_version: st.claude_code_version.clone(),
+    };
+    let (tx, rx) = mpsc::channel::<Bytes>(64);
+    if req.stream {
+        // Resolve credentials and open the upstream stream first so auth/validation
+        // failures still come back as a proper HTTP status.
+        let (probe_tx, mut probe_rx) = tokio::sync::oneshot::channel::<Option<chat::OpenAiError>>();
+        let mut probe_tx = Some(probe_tx);
+        let rx_stream = rx;
+        tokio::spawn(async move {
+            let outcome = chat::run(input, tx).await;
+            if let Some(p) = probe_tx.take() {
+                let _ = p.send(outcome.error);
+            }
+        });
+        // Wait for either first bytes or an early error.
+        let mut rx_stream = rx_stream;
+        let first = tokio::select! {
+            b = rx_stream.recv() => b,
+            e = &mut probe_rx => {
+                if let Ok(Some(err)) = e { return openai_error(&err); }
+                None
+            }
+        };
+        let body_stream = async_stream::stream! {
+            if let Some(b) = first {
+                yield Ok::<Bytes, Infallible>(b);
+            }
+            while let Some(b) = rx_stream.recv().await {
+                yield Ok::<Bytes, Infallible>(b);
+            }
+        };
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header("x-accel-buffering", "no")
+            .body(Body::from_stream(body_stream))
+            .expect("valid response");
+    }
+    drop(rx);
+    let outcome = chat::run(input, tx).await;
+    if let Some(e) = outcome.error {
+        return openai_error(&e);
+    }
+    Json(outcome.converter.completion()).into_response()
+}
+
 async fn health() -> Json<Value> {
     Json(json!({"status": "ok", "service": "claude-openai-proxy"}))
 }
 
+/// Model list in a shape both OpenAI and Anthropic clients accept.
 async fn models(State(st): State<Shared>) -> Json<Value> {
-    let data: Vec<Value> = st
-        .cfg
-        .known_models()
+    const CLAUDE: [&str; 8] = [
+        "claude-fable-5-1", "claude-fable-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
+        "claude-sonnet-5", "claude-sonnet-4-6", "claude-haiku-4-5",
+    ];
+    let mut ids: Vec<String> = CLAUDE.iter().map(|s| s.to_string()).collect();
+    ids.extend(st.cfg.known_models());
+    ids.extend(st.cfg.chat_model_map.keys().cloned());
+    ids.sort();
+    ids.dedup();
+    let data: Vec<Value> = ids
         .into_iter()
-        .map(|id| json!({"id": id, "type": "model", "display_name": id, "created_at": "2026-01-01T00:00:00Z"}))
+        .map(|id| json!({"id": id, "object": "model", "owned_by": "anthropic", "created": 1767225600,
+                         "type": "model", "display_name": id, "created_at": "2026-01-01T00:00:00Z"}))
         .collect();
-    Json(json!({"data": data, "has_more": false, "first_id": null, "last_id": null}))
+    Json(json!({"object": "list", "data": data, "has_more": false, "first_id": null, "last_id": null}))
 }
 
 /// Rough token estimate (~4 chars/token). Claude Code only uses it for context accounting.

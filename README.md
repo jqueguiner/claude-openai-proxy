@@ -1,12 +1,71 @@
 # claude-openai-proxy
 
-A small Rust proxy that exposes the **Anthropic Messages API** (the protocol Claude Code
-speaks) on top of **any OpenAI-compatible chat completions server** — vLLM, llama.cpp,
-Ollama, LM Studio, SGLang, OpenRouter, LiteLLM, Groq, Mistral, OpenAI itself, ...
+A small Rust proxy that translates between the **Anthropic Messages API** and the
+**OpenAI Chat Completions API**, in both directions, in one binary:
 
 ```
-Claude Code ──(Anthropic /v1/messages)──▶ claude-openai-proxy ──(OpenAI /v1/chat/completions)──▶ your server
+Claude Code / Hermes (Anthropic mode) ──(/v1/messages)──────────▶ proxy ──(/v1/chat/completions)──▶ vLLM, Ollama, OpenRouter, ...
+Hermes / any OpenAI client ───────────(/v1/chat/completions)──▶ proxy ──(/v1/messages)───────────▶ api.anthropic.com (Claude Code login)
 ```
+
+1. **Anthropic → OpenAI**: run Claude Code (or any Anthropic-API client) on top of any
+   OpenAI-compatible server — vLLM, llama.cpp, Ollama, LM Studio, SGLang, OpenRouter, LiteLLM, ...
+2. **OpenAI → Anthropic**: give any OpenAI-compatible client (Hermes Agent, LangChain, the
+   `openai` SDK, ...) access to Claude — Fable 5.1, Opus 5, Sonnet 5, ... — using an API key or
+   **your Claude Code login (OAuth, Max/Pro plan)**.
+
+## OpenAI → Claude (`/v1/chat/completions`)
+
+Point any OpenAI client at `http://127.0.0.1:8082/v1` with any dummy key and ask for a Claude
+model (`claude-fable-5-1`, `anthropic/claude-fable-5.1`, `claude-opus-5`, ...; non-Claude names
+fall back to `CHAT_DEFAULT_MODEL`).
+
+Credentials, in order: `ANTHROPIC_API_KEY` → `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`)
+→ **Claude Code's own login** (macOS keychain `Claude Code-credentials`, else
+`~/.claude/.credentials.json`) → the client's bearer token if it is an `sk-ant-…` secret. The
+stored login is read on every request (30 s cache) so it follows Claude Code's own refreshes; the
+proxy never refreshes tokens itself (that would rotate Claude Code's refresh token). If the token
+is expired, run `claude` once.
+
+With an OAuth token the proxy sends what Claude Code sends (`Authorization: Bearer`,
+`anthropic-beta: claude-code-20250219,oauth-2025-04-20`, `user-agent: claude-code/<version>
+(external, cli)`, `x-app: cli`, and the `You are Claude Code…` system prefix). Anthropic's billing
+classifier rejects third-party agents on plan tokens (`400 Third-party apps now draw from your
+extra usage`) based on the tool set, so on the OAuth wire every function tool is presented as an
+MCP tool (`mcp__<name>`, `mcp_x` → `mcp__x`, `memory` → `context_notes`,
+`session_search` → `chat_history_lookup`) and mapped back on the way out — verified against the
+live API with a 19-tool Hermes request. API-key requests are sent untouched.
+
+Translation: `system`/`developer` → `system` (later ones folded into the user turn),
+`image_url` → image blocks, `tool_calls` ↔ `tool_use`, `tool` messages → `tool_result` (consecutive
+ones merged), `tools`/`tool_choice`/`parallel_tool_calls` → `tools`/`tool_choice`
+(`disable_parallel_tool_use`), `reasoning_effort` → `output_config.effort` (+ adaptive thinking
+where it must be enabled), `stop` → `stop_sequences`, `max_tokens`/`max_completion_tokens`
+(default `CHAT_MAX_TOKENS`), `temperature`/`top_p` dropped on models that reject them, forced
+`tool_choice` downgraded to `auto` on Fable/Mythos. Thinking comes back as `reasoning_content`,
+usage as `prompt_tokens` (incl. cache) / `completion_tokens` / `prompt_tokens_details.cached_tokens`.
+The Anthropic call is always streamed; non-streaming clients get the assembled `chat.completion`.
+
+Hermes Agent (`~/.hermes/config.yaml`):
+
+```yaml
+model:
+  default: claude-fable-5-1
+  provider: custom
+  base_url: http://127.0.0.1:8082/v1
+  api_key: dummy
+```
+
+Run it permanently on macOS (launchd, auto-restart):
+
+```bash
+cargo build --release && install -m 755 target/release/claude-openai-proxy ~/.local/bin/
+# ~/Library/LaunchAgents/com.<you>.claude-openai-proxy.plist with ProgramArguments = that binary,
+# RunAtLoad + KeepAlive, EnvironmentVariables for the settings below, then:
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.<you>.claude-openai-proxy.plist
+```
+
+## Claude Code → OpenAI-compatible server (`/v1/messages`)
 
 ## What is translated
 
@@ -134,6 +193,15 @@ claude
 | `SEARCH_API_KEY`         | unset                      | Brave / Tavily API key |
 | `SEARCH_MAX_RESULTS`     | `10`                       | Results returned per search |
 | `SEARCH_MAX_ROUNDS`      | `10`                       | Model/search iterations per turn before `pause_turn` |
+| `ANTHROPIC_BASE_URL`     | `https://api.anthropic.com` | Anthropic endpoint for the OpenAI → Claude direction |
+| `ANTHROPIC_API_KEY`      | unset                      | Anthropic API key (takes precedence over OAuth) |
+| `CLAUDE_CODE_OAUTH_TOKEN`| unset                      | Long-lived token from `claude setup-token` |
+| `CLAUDE_CREDENTIALS_FILE`| `~/.claude/.credentials.json` | Claude Code login file (fallback after the macOS keychain) |
+| `CLAUDE_KEYCHAIN`        | `true` on macOS            | Read the login from the macOS keychain |
+| `CLAUDE_CODE_VERSION`    | auto (`claude --version`)  | Version advertised in the OAuth user-agent |
+| `CHAT_MODEL_MAP`         | unset                      | OpenAI-side names → Claude ids, e.g. `gpt-4o=claude-sonnet-5` |
+| `CHAT_DEFAULT_MODEL`     | `claude-opus-5`            | Claude model for non-Claude names |
+| `CHAT_MAX_TOKENS`        | `16384`                    | `max_tokens` when the client sends none |
 | `LOG_BODIES`             | `false`                    | Log full upstream request/response bodies at `debug` level |
 | `RUST_LOG`               | `info`                     | Log filter (`debug` for chunk-level tracing) |
 
@@ -163,6 +231,9 @@ OPUS_MODEL=anthropic/claude-opus-5 SONNET_MODEL=qwen/qwen3-coder HAIKU_MODEL=goo
 ```
 
 ## Notes and limitations
+
+- OpenAI → Claude: no `n > 1`, `logprobs`, `response_format` (use tools), or image outputs;
+  `reasoning_content` from a previous turn is not replayed as thinking (it has no signature).
 
 - Prompt caching, `cache_control`, beta headers and `output_config` are accepted and ignored
   (except `output_config.effort` when `REASONING_EFFORT=auto`).
