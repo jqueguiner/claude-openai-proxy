@@ -60,6 +60,11 @@ async fn main() {
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/models", get(models))
+        // Same API under an `/anthropic` prefix: some clients (Hermes Agent, gateways)
+        // detect the Anthropic Messages transport from a base URL ending in `/anthropic`.
+        .route("/anthropic/v1/messages", post(messages))
+        .route("/anthropic/v1/messages/count_tokens", post(count_tokens))
+        .route("/anthropic/v1/models", get(models))
         .layer(DefaultBodyLimit::disable())
         .with_state(state.clone());
 

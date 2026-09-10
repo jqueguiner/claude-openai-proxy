@@ -72,7 +72,24 @@ Backends:
 model/search iterations per turn.
 
 Endpoints: `POST /v1/messages`, `POST /v1/messages/count_tokens` (rough estimate, ~4 chars/token),
-`GET /v1/models`, `GET /health`.
+`GET /v1/models`, `GET /health`. The same routes exist under `/anthropic/v1/...` for clients that
+detect the Anthropic transport from the base URL.
+
+### Other Anthropic-API clients (Hermes Agent, SDKs)
+
+Anything that speaks the Anthropic Messages API can sit in front of the proxy. Hermes Agent
+example (`~/.hermes/config.yaml`):
+
+```yaml
+model:
+  default: claude-opus-5          # mapped by the proxy to the upstream model
+  provider: custom
+  base_url: http://127.0.0.1:8082/anthropic
+  api_key: dummy
+  api_mode: anthropic_messages
+```
+
+Tested with Hermes Agent 0.21 (tool calls over the terminal toolset) against Ollama `llama3.1:8b`.
 
 ## Build
 
