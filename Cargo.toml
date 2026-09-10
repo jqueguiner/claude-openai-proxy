@@ -1,0 +1,26 @@
+[package]
+name = "claude-openai-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "Proxy that exposes the Anthropic Messages API (used by Claude Code) on top of any OpenAI-compatible chat completions server"
+license = "MIT"
+repository = "https://github.com/jqueguiner/claude-openai-proxy"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = "0.3"
+async-stream = "0.3"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+url = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
