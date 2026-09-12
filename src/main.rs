@@ -141,12 +141,31 @@ async fn chat_completions(State(st): State<Shared>, headers: HeaderMap, body: By
             }
         });
         // Wait for either first bytes or an early error.
+        //
+        // `select!` races two channels, and a closed channel resolves too:
+        // when upstream fails before emitting anything (a 429 or a 401 on the
+        // very first call), `tx` is dropped and `recv()` returns `None`
+        // immediately — often winning the race against the probe. Taking that
+        // `None` as "stream finished" produced a 200 with an empty body, i.e.
+        // the exact bug this code was meant to prevent. So when `recv()`
+        // yields `None`, wait for the probe before deciding: the error is
+        // already on its way and the status line has not been written yet.
         let mut rx_stream = rx_stream;
         let first = tokio::select! {
-            b = rx_stream.recv() => b,
+            b = rx_stream.recv() => match b {
+                Some(b) => Some(b),
+                None => {
+                    if let Ok(Some(err)) = (&mut probe_rx).await {
+                        return openai_error(&err);
+                    }
+                    None
+                }
+            },
             e = &mut probe_rx => {
                 if let Ok(Some(err)) = e { return openai_error(&err); }
-                None
+                // The probe fired first with no error: the run finished
+                // cleanly. Drain whatever it managed to queue.
+                rx_stream.recv().await
             }
         };
         let body_stream = async_stream::stream! {

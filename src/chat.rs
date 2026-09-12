@@ -615,8 +615,32 @@ impl Converter {
     }
 
     /// Emit the final chunk(s) and `[DONE]`.
-    pub fn finish(&mut self, out: &mut Vec<u8>) {
+    ///
+    /// `saw_terminal` says whether upstream actually told us the turn ended
+    /// (a `message_delta` carrying `stop_reason`, or `message_stop`). When it
+    /// did not, the stream was cut short: an upstream drop, a killed process,
+    /// a proxy timeout. Reporting `finish_reason: "stop"` in that case
+    /// fabricates a clean end of turn that never happened, and the client has
+    /// no way to tell it apart from a real one — it just sees an assistant
+    /// turn with no content and moves on.
+    ///
+    /// OpenAI's own vocabulary has no code for "the stream died", so we emit
+    /// an SSE `error` event instead of a final chunk. Clients that follow the
+    /// OpenAI protocol surface it as an error and retry, rather than
+    /// accepting an empty answer as final.
+    pub fn finish_with(&mut self, out: &mut Vec<u8>, saw_terminal: bool) {
         if self.done {
+            return;
+        }
+        if !saw_terminal && self.finish_reason.is_none() {
+            Self::write(out, &json!({"error": {
+                "message": "upstream stream ended before the turn was complete \
+                            (no stop_reason received); the response is incomplete",
+                "type": "api_error",
+                "code": "incomplete_stream",
+            }}));
+            out.extend_from_slice(b"data: [DONE]\n\n");
+            self.done = true;
             return;
         }
         let finish = self.finish_reason.clone().unwrap_or_else(|| "stop".into());
@@ -630,6 +654,17 @@ impl Converter {
         Self::write(out, &last);
         out.extend_from_slice(b"data: [DONE]\n\n");
         self.done = true;
+    }
+
+    /// Backwards-compatible entry point: assumes the turn ended normally.
+    /// Used on the paths where upstream already signalled a terminal event.
+    pub fn finish(&mut self, out: &mut Vec<u8>) {
+        self.finish_with(out, true);
+    }
+
+    /// True once upstream sent something that genuinely ends the turn.
+    pub fn saw_terminal(&self) -> bool {
+        self.done || self.finish_reason.is_some()
     }
 
     /// Non-streaming `chat.completion` object built from what was accumulated.
@@ -767,6 +802,11 @@ pub async fn run(input: ChatInput, tx: mpsc::Sender<Bytes>) -> ChatOutcome {
     let mut parser = SseParser::default();
     let mut upstream = resp.bytes_stream();
     let streaming = req.stream;
+    // Did upstream actually end the turn? Set only by a real terminal event
+    // (`message_stop`, or a `message_delta` carrying `stop_reason`). If the
+    // connection simply stops, this stays false and we refuse to present the
+    // result as a completed turn.
+    let mut saw_terminal = false;
     while let Some(item) = upstream.next().await {
         match item {
             Ok(bytes) => {
@@ -775,7 +815,12 @@ pub async fn run(input: ChatInput, tx: mpsc::Sender<Bytes>) -> ChatOutcome {
                         debug!(data = %data, "anthropic event");
                     }
                     match serde_json::from_str::<Value>(&data) {
-                        Ok(ev) => conv.handle(&ev, &mut out),
+                        Ok(ev) => {
+                            conv.handle(&ev, &mut out);
+                            if conv.saw_terminal() {
+                                saw_terminal = true;
+                            }
+                        }
                         Err(e) => warn!(error = %e, data = %data, "unparseable anthropic event"),
                     }
                 }
@@ -798,9 +843,27 @@ pub async fn run(input: ChatInput, tx: mpsc::Sender<Bytes>) -> ChatOutcome {
             }
         }
     }
-    conv.finish(&mut out);
+    conv.finish_with(&mut out, saw_terminal);
     if streaming && !out.is_empty() {
         let _ = tx.send(Bytes::from(out)).await;
+    }
+    // A stream that ended without a terminal event did not deliver a real
+    // answer. Say so on the non-streaming path too, where the caller reads
+    // `error` rather than the SSE body — otherwise the caller gets a
+    // perfectly shaped completion whose content is empty and cannot tell it
+    // apart from a model that genuinely had nothing to say.
+    if !saw_terminal {
+        warn!("anthropic stream ended with no terminal event; reporting incomplete");
+        return ChatOutcome {
+            converter: conv,
+            error: Some(OpenAiError {
+                status: 502,
+                kind: "api_error".into(),
+                message: "anthropic stream ended before the turn was complete \
+                          (no stop_reason received)"
+                    .into(),
+            }),
+        };
     }
     ChatOutcome { converter: conv, error: None }
 }
@@ -925,6 +988,77 @@ mod tests {
             .filter(|d| *d != "[DONE]")
             .map(|d| serde_json::from_str(d).unwrap())
             .collect()
+    }
+
+    /// A stream cut short must NOT be reported as a finished turn.
+    ///
+    /// Regression test for the bug behind Hermes's "empty stream with no
+    /// finish_reason": upstream dropped the connection mid-turn, `finish()`
+    /// defaulted to `finish_reason: "stop"`, and the agent read a perfectly
+    /// well-formed empty answer as a real end of turn. Measured 2026-09-12:
+    /// 82 occurrences in three days.
+    #[test]
+    fn truncated_stream_is_an_error_not_a_clean_stop() {
+        let mut c = Converter::new("claude-opus-5".into(), true);
+        let mut out = Vec::new();
+        // The turn starts, some text arrives, then upstream goes silent:
+        // no `message_delta` with a stop_reason, no `message_stop`.
+        c.handle(&json!({"type": "message_start", "message": {"usage": {"input_tokens": 3}}}), &mut out);
+        c.handle(&json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}), &mut out);
+        c.handle(&json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Bon"}}), &mut out);
+        assert!(!c.saw_terminal(), "no terminal event was sent yet");
+
+        out.clear();
+        c.finish_with(&mut out, false);
+        let ev = events(&out);
+        assert_eq!(ev.len(), 1, "exactly one event: the error");
+        assert_eq!(ev[0]["error"]["code"], "incomplete_stream");
+        // The crux: no chunk may claim the turn ended normally.
+        let raw = String::from_utf8_lossy(&out);
+        assert!(!raw.contains("\"finish_reason\": \"stop\""), "must not fabricate a stop");
+        assert!(raw.contains("[DONE]"), "the SSE stream is still closed properly");
+    }
+
+    /// The normal path must keep working: a real stop stays a real stop.
+    #[test]
+    fn genuine_stop_is_preserved() {
+        let mut c = Converter::new("claude-opus-5".into(), true);
+        let mut out = Vec::new();
+        c.handle(&json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}), &mut out);
+        c.handle(&json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hi"}}), &mut out);
+        c.handle(&json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}), &mut out);
+        assert!(c.saw_terminal(), "a stop_reason is a terminal event");
+
+        out.clear();
+        c.finish_with(&mut out, true);
+        let ev = events(&out);
+        assert_eq!(ev[0]["choices"][0]["finish_reason"], "stop");
+        assert!(ev.iter().all(|e| e.get("error").is_none()), "no error on a clean turn");
+    }
+
+    /// A turn ending on a tool call is terminal too, and must not be flagged.
+    #[test]
+    fn tool_use_stop_is_terminal() {
+        let mut c = Converter::new("claude-opus-5".into(), true);
+        let mut out = Vec::new();
+        c.handle(&json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "t1", "name": "ls", "input": {}}}), &mut out);
+        c.handle(&json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}}), &mut out);
+        assert!(c.saw_terminal());
+        out.clear();
+        c.finish_with(&mut out, true);
+        assert_eq!(events(&out)[0]["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    /// Zero content AND no terminal event is the exact production signature:
+    /// upstream accepted the request, sent nothing at all, and hung up.
+    #[test]
+    fn empty_stream_with_no_events_is_an_error() {
+        let mut c = Converter::new("claude-opus-5".into(), true);
+        let mut out = Vec::new();
+        c.finish_with(&mut out, false);
+        let ev = events(&out);
+        assert_eq!(ev[0]["error"]["code"], "incomplete_stream");
+        assert!(!String::from_utf8_lossy(&out).contains("finish_reason\": \"stop"));
     }
 
     #[test]
