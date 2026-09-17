@@ -282,8 +282,32 @@ pub fn build_anthropic_request(req: &ChatCompletionRequest, cfg: &Config, model:
         "max_tokens".into(),
         json!(req.max_completion_tokens.or(req.max_tokens).unwrap_or(cfg.chat_max_tokens)),
     );
+    // Prompt caching. Without an explicit `cache_control`, Anthropic re-reads the
+    // whole prefix at full price on every turn: a long Desk thread then costs
+    // O(n^2) input tokens. We mark the largest stable prefixes as `ephemeral`
+    // so each turn only pays for what changed since the last one.
+    //
+    // Anthropic allows at most 4 breakpoints, and everything *before* a
+    // breakpoint is cached, so we spend them on the boundaries that stay byte
+    // identical across turns: end of system, then the last message of the
+    // conversation prefix (all turns but the newest exchange).
     if !system.is_empty() {
+        if let Some(last) = system.last_mut() {
+            last["cache_control"] = json!({"type": "ephemeral"});
+        }
         body.insert("system".into(), Value::Array(system));
+    }
+    // Cache the history prefix, excluding the final (new) user message: that one
+    // differs every turn, so a breakpoint on it would never hit.
+    let cache_upto = messages.len().saturating_sub(1);
+    if cache_upto > 0 {
+        if let Some((_, blocks)) = messages.get_mut(cache_upto - 1) {
+            if let Some(last) = blocks.last_mut() {
+                if last.is_object() {
+                    last["cache_control"] = json!({"type": "ephemeral"});
+                }
+            }
+        }
     }
     body.insert(
         "messages".into(),
@@ -324,6 +348,12 @@ pub fn build_anthropic_request(req: &ChatCompletionRequest, cfg: &Config, model:
         })
         .collect();
     if !tools.is_empty() {
+        // Tools sit at the very front of the cached prefix and Hermes ships a
+        // large, stable tool list on every call: cache past the last one.
+        let mut tools = tools;
+        if let Some(last) = tools.last_mut() {
+            last["cache_control"] = json!({"type": "ephemeral"});
+        }
         body.insert("tools".into(), Value::Array(tools));
         let mut choice: Option<Value> = match &req.tool_choice {
             None => None,
@@ -874,6 +904,56 @@ mod tests {
 
     fn cfg() -> Config {
         Config { chat_max_tokens: 4096, ..Default::default() }
+    }
+
+    #[test]
+    fn sets_cache_breakpoints_on_system_tools_and_history_prefix() {
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "claude-opus-5",
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": "newest"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "ls", "description": "list", "parameters": {"type": "object", "properties": {}}}}],
+        }))
+        .unwrap();
+        let built = build_anthropic_request(&req, &cfg(), "claude-opus-5", false);
+        let b = &built.body;
+
+        // System prefix cached.
+        let system = b["system"].as_array().unwrap();
+        assert_eq!(system.last().unwrap()["cache_control"]["type"], "ephemeral");
+
+        // Tool list cached.
+        let tools = b["tools"].as_array().unwrap();
+        assert_eq!(tools.last().unwrap()["cache_control"]["type"], "ephemeral");
+
+        // History prefix cached up to, but NOT including, the newest user turn.
+        let msgs = b["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        let prefix_last = msgs[msgs.len() - 2]["content"].as_array().unwrap().last().unwrap();
+        assert_eq!(prefix_last["cache_control"]["type"], "ephemeral");
+        let newest = msgs[msgs.len() - 1]["content"].as_array().unwrap().last().unwrap();
+        assert!(newest.get("cache_control").is_none(), "newest turn must not be a breakpoint");
+
+        // At most 4 breakpoints, per the Anthropic API limit.
+        let count = serde_json::to_string(b).unwrap().matches("cache_control").count();
+        assert!(count <= 4, "too many cache breakpoints: {count}");
+    }
+
+    #[test]
+    fn single_message_request_has_no_history_breakpoint() {
+        let req: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "claude-opus-5",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .unwrap();
+        let built = build_anthropic_request(&req, &cfg(), "claude-opus-5", false);
+        let msgs = built.body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0]["content"].as_array().unwrap().last().unwrap().get("cache_control").is_none());
     }
 
     #[test]
